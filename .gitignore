@@ -1,0 +1,63 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Mac-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Additional Python-specific files
+.pytest_cache/
+.coverage
+.tox/
+nox/
+.eggs/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.installed.cfg
+.coverage.*
+.cache
+.pytest_cache
+.nox/
+.mypy_cache/
+.pyre/
+.hypothesis/
+.pytype/
+
+# IDE-specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Other common files
+*.log
+.env
+tmp/
+temp/
+
+# application specific files
+.api_secrets
+.cache
+data/
+logs/
