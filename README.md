@@ -34,32 +34,79 @@
    - Edit `.api_secrets` and replace the placeholder values with your actual Client ID and Client Secret
 
 5. **Update the script:**
-   - Save the Python code as `spotify_exporter.py` in your project directory
+   - Save the Python code as `spoti_lists.py` in your project directory
 
 ## Usage:
 
+### Command Line Options:
+
 ```bash
 # Run the script and it will list your playlists
-uv run spotify_exporter.py
+uv run spoti_lists.py
 
-# Or specify a playlist name directly
-uv run spotify_exporter.py --playlist "My Awesome Playlist"
+# Export a specific playlist
+uv run spoti_lists.py --playlist "My Awesome Playlist"
+
+# Export only your Liked Songs
+uv run spoti_lists.py --liked
+
+# Export all playlists INCLUDING Liked Songs
+uv run spoti_lists.py --all
 
 # You can also provide client ID and secret as arguments (optional if in .api_secrets)
-uv run spotify_exporter.py --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
+uv run spoti_lists.py --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
+
+# Skip audio features (faster export with fewer API calls)
+uv run spoti_lists.py --playlist "My Playlist" --no-features
+
+# Merge all CSV files in /data directory
+uv run spoti_lists.py --merge
 ```
 
-## Alternative: One-line setup with uv
+### Using Makefile:
 
-If you prefer to set up everything in one go:
+The project includes a Makefile for easier usage:
 
 ```bash
-# Create project, add dependency, and run in one flow
-uv init spotify-exporter && cd spotify-exporter && uv add spotipy
-# Then save the script as spotify_exporter.py and set up your .api_secrets file
-# Finally run:
-uv run spotify_exporter.py
+# List all available playlists
+make list_playlists
+
+# Download all playlists including Liked Songs and merge into total_list.csv
+make download_all
+
+# Download all playlists including Liked Songs
+make download_lists
+
+# Download only Liked Songs
+make download_liked
+
+# Download a specific playlist
+make download_playlist PLAYLIST="My Awesome Playlist"
+
+# Merge all CSV files in /data directory
+make merge_lists
+
+# Install dependencies
+make install
+
+# Clean generated files
+make clean
 ```
+
+## Troubleshooting:
+
+### INVALID_CLIENT: Invalid redirect URI Error
+
+If you encounter this error when running the script, it means the redirect URI configured in your Spotify app doesn't match what the script is using. To fix this:
+
+1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard/)
+2. Select your app
+3. Click "Edit Settings"
+4. In the "Redirect URIs" section, make sure `http://127.0.0.1:8080/callback` is listed
+5. If it's not there, add it and click "Save"
+6. Try running the script again
+
+Note: The redirect URI must exactly match what's in the code (`http://127.0.0.1:8080/callback`). Using `localhost` instead of `127.0.0.1` or a different port will cause this error.
 
 ## Features:
 
@@ -76,4 +123,17 @@ When you run it for the first time, it will:
 2. Ask for permission to read your playlists
 3. Redirect to localhost (you can close the browser tab after authentication)
 
-The CSV file will be saved with all the track metadata, making it easy to analyze your music in Excel, Google Sheets, or any other tool!
+The CSV files will be saved in the `data/` directory with all the track metadata, making it easy to analyze your music in Excel, Google Sheets, or any other tool!
+
+## Output Format:
+
+Each playlist (including Liked Songs) is exported as a separate CSV file in the `data/` directory:
+- Playlist files are named after the playlist (e.g., `My Playlist.csv`)
+- Liked Songs are exported as `Liked Songs.csv`
+- Merged playlists are saved as `data/total_list.csv`
+
+All CSV files include the following columns:
+- Track information (name, artists, album, etc.)
+- Spotify data (popularity, duration, URLs)
+- Audio features (danceability, energy, tempo, etc.)
+- Playlist-specific data (when added, who added)

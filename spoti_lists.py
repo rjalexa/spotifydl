@@ -731,6 +731,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Export only Liked Songs.",
     )
+    p.add_argument(
+        "--no-liked",
+        action="store_true",
+        help="Exclude Liked Songs when exporting all playlists.",
+    )
     return p.parse_args(argv)
 
 
@@ -788,11 +793,11 @@ def main(argv: List[str]):
             print(f"Unexpected error: {e}")
             sys.exit(1)
     elif args.all:
-        # Export all playlists including Liked Songs
+        # Export all playlists, optionally including Liked Songs
         try:
             ok = exporter.export_all_playlists(
                 fetch_features=(not args.no_features),
-                include_liked_songs=True
+                include_liked_songs=not args.no_liked
             )
             if ok:
                 print("Export completed successfully!")
