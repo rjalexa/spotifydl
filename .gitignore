@@ -58,7 +58,6 @@ temp/
 
 # application specific files
 .api_secrets
-.cache
 data/
 logs/
 secrets/
