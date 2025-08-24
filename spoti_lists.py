@@ -12,7 +12,8 @@ from spotipy.exceptions import SpotifyException
 
 
 REDIRECT_URI_DEFAULT = "http://127.0.0.1:8080/callback"  # loopback HTTP is allowed
-SCOPE = "playlist-read-private playlist-read-collaborative"
+# Added user-library-read scope for Liked Songs access
+SCOPE = "playlist-read-private playlist-read-collaborative user-library-read"
 
 
 def load_secrets():
@@ -79,16 +80,143 @@ class SpotifyPlaylistExporter:
 
     def list_playlists(self) -> List[dict]:
         playlists = self.get_user_playlists()
-        print(f"Found {len(playlists)} playlists:")
-        for i, p in enumerate(playlists, 1):
+        
+        # Get count of liked songs
+        liked_songs_info = self._retry(lambda: self.sp.current_user_saved_tracks(limit=1))
+        liked_songs_count = liked_songs_info.get('total', 0) if liked_songs_info else 0
+        
+        print(f"Found {len(playlists) + 1} playlists:")
+        print(f" 1. Liked Songs ({liked_songs_count} tracks) [Special Collection]")
+        
+        for i, p in enumerate(playlists, 2):
             print(f"{i:2d}. {p['name']} ({p['tracks']['total']} tracks)")
         return playlists
 
     def find_playlist_by_name(self, playlist_name: str) -> Optional[dict]:
+        # Special handling for "Liked Songs"
+        if playlist_name.lower() in ["liked songs", "liked", "saved songs", "saved"]:
+            # Return a special marker for liked songs
+            return {"id": "LIKED_SONGS", "name": "Liked Songs", "tracks": {"total": -1}}
+        
         for playlist in self.get_user_playlists():
             if playlist["name"].lower() == playlist_name.lower():
                 return playlist
         return None
+
+    # ---------- Liked Songs support ----------
+    def get_liked_songs(self, fetch_features: bool = True) -> List[dict]:
+        """Fetch all liked/saved songs from the user's library."""
+        tracks: List[dict] = []
+        raw_items: List[dict] = []
+        
+        print("Fetching liked songs...")
+        
+        # 1) Gather all liked songs
+        results = self._retry(lambda: self.sp.current_user_saved_tracks(limit=50))
+        total = results.get('total', 0) if results else 0
+        print(f"Total liked songs: {total}")
+        
+        while results:
+            raw_items.extend(results["items"])
+            print(f"  Fetched {len(raw_items)}/{total} songs...")
+            if results.get("next"):
+                results = self._retry(lambda: self.sp.next(results))
+            else:
+                break
+        
+        # 2) Filter to valid track items and collect IDs
+        valid_ids: List[str] = []
+        for item in raw_items:
+            tr = item.get("track")
+            if not tr:
+                continue
+            if tr.get("is_local"):
+                continue
+            if not tr.get("id"):
+                continue
+            valid_ids.append(tr["id"])
+        
+        # 3) Batch-fetch audio features if requested
+        features_by_id: Dict[str, Optional[dict]] = {}
+        if fetch_features and valid_ids:
+            print(f"Fetching audio features for {len(valid_ids)} tracks...")
+            for i in range(0, len(valid_ids), 100):
+                batch = valid_ids[i : i + 100]
+                
+                def _get_feats():
+                    return self.sp.audio_features(batch)
+                
+                feats_list = self._retry(_get_feats, swallow_statuses={403})
+                for tid, feats in zip(batch, feats_list or [None] * len(batch)):
+                    features_by_id[tid] = feats
+        
+        # 4) Build final rows
+        for item in raw_items:
+            tr = item.get("track")
+            if not tr or tr.get("is_local") or not tr.get("id"):
+                continue
+            
+            dur_ms = tr.get("duration_ms") or 0
+            track_row = {
+                "track_name": tr.get("name", ""),
+                "artist_names": ", ".join(
+                    a["name"] for a in tr.get("artists", []) if a and a.get("name")
+                ),
+                "album_name": tr.get("album", {}).get("name", ""),
+                "album_type": tr.get("album", {}).get("album_type", ""),
+                "release_date": tr.get("album", {}).get("release_date", ""),
+                "duration_ms": dur_ms,
+                "duration_min_sec": f"{dur_ms // 60000}:{(dur_ms % 60000) // 1000:02d}",
+                "popularity": tr.get("popularity", ""),
+                "explicit": tr.get("explicit", ""),
+                "track_number": tr.get("track_number", ""),
+                "disc_number": tr.get("disc_number", ""),
+                "spotify_id": tr.get("id", ""),
+                "spotify_url": tr.get("external_urls", {}).get("spotify", ""),
+                "preview_url": tr.get("preview_url") or "",
+                "added_at": item.get("added_at", ""),
+                "added_by": "me",  # Liked songs are always added by the user
+            }
+            
+            feats = features_by_id.get(tr["id"]) if fetch_features else None
+            if feats:
+                track_row.update(
+                    {
+                        "danceability": feats.get("danceability", ""),
+                        "energy": feats.get("energy", ""),
+                        "key": feats.get("key", ""),
+                        "loudness": feats.get("loudness", ""),
+                        "mode": feats.get("mode", ""),
+                        "speechiness": feats.get("speechiness", ""),
+                        "acousticness": feats.get("acousticness", ""),
+                        "instrumentalness": feats.get("instrumentalness", ""),
+                        "liveness": feats.get("liveness", ""),
+                        "valence": feats.get("valence", ""),
+                        "tempo": feats.get("tempo", ""),
+                        "time_signature": feats.get("time_signature", ""),
+                    }
+                )
+            else:
+                track_row.update(
+                    {
+                        "danceability": "",
+                        "energy": "",
+                        "key": "",
+                        "loudness": "",
+                        "mode": "",
+                        "speechiness": "",
+                        "acousticness": "",
+                        "instrumentalness": "",
+                        "liveness": "",
+                        "valence": "",
+                        "tempo": "",
+                        "time_signature": "",
+                    }
+                )
+            
+            tracks.append(track_row)
+        
+        return tracks
 
     # ---------- tracks & audio features ----------
     def get_playlist_tracks(
@@ -227,14 +355,23 @@ class SpotifyPlaylistExporter:
         if not playlist:
             print(f"Playlist '{playlist_name}' not found!")
             print("Available playlists:")
+            print("  - Liked Songs")
             for p in self.get_user_playlists():
                 print(f"  - {p['name']}")
             return False
 
-        total = playlist["tracks"]["total"]
-        print(f"Found playlist: {playlist['name']} ({total} tracks)")
-        print("Fetching track data...")
-        tracks = self.get_playlist_tracks(playlist["id"], fetch_features=fetch_features)
+        # Check if this is the special "Liked Songs" playlist
+        if playlist.get("id") == "LIKED_SONGS":
+            print("Found special collection: Liked Songs")
+            print("Fetching liked songs data...")
+            tracks = self.get_liked_songs(fetch_features=fetch_features)
+            playlist_name = "Liked Songs"
+        else:
+            total = playlist["tracks"]["total"]
+            print(f"Found playlist: {playlist['name']} ({total} tracks)")
+            print("Fetching track data...")
+            tracks = self.get_playlist_tracks(playlist["id"], fetch_features=fetch_features)
+        
         if not tracks:
             print("No exportable tracks found.")
             return False
@@ -286,18 +423,81 @@ class SpotifyPlaylistExporter:
         print(f"Successfully exported playlist to {filepath}")
         return True
 
-    def export_all_playlists(self, fetch_features: bool = True) -> bool:
+    def export_all_playlists(self, fetch_features: bool = True, include_liked_songs: bool = True) -> bool:
         """Export all playlists to CSV files in the /data directory."""
         playlists = self.get_user_playlists()
-        if not playlists:
+        
+        # Optionally add Liked Songs to the export list
+        total_count = len(playlists)
+        if include_liked_songs:
+            total_count += 1
+        
+        if total_count == 0:
             print("No playlists found!")
             return False
 
-        print(f"Found {len(playlists)} playlists. Exporting all...")
+        print(f"Found {total_count} playlists. Exporting all...")
         success_count = 0
+        
+        # Export Liked Songs first if requested
+        if include_liked_songs:
+            print(f"\n[1/{total_count}] Exporting 'Liked Songs'...")
+            try:
+                tracks = self.get_liked_songs(fetch_features=fetch_features)
+                if not tracks:
+                    print("  No liked songs found.")
+                else:
+                    filename = self._safe_filename("Liked Songs")
+                    filepath = os.path.join("data", filename)
+                    print(f"  Writing {len(tracks)} tracks to {filepath}...")
+                    
+                    fieldnames = [
+                        "track_name",
+                        "artist_names",
+                        "album_name",
+                        "album_type",
+                        "release_date",
+                        "duration_ms",
+                        "duration_min_sec",
+                        "popularity",
+                        "explicit",
+                        "track_number",
+                        "disc_number",
+                        "spotify_id",
+                        "spotify_url",
+                        "preview_url",
+                        "added_at",
+                        "added_by",
+                        "danceability",
+                        "energy",
+                        "key",
+                        "loudness",
+                        "mode",
+                        "speechiness",
+                        "acousticness",
+                        "instrumentalness",
+                        "liveness",
+                        "valence",
+                        "tempo",
+                        "time_signature",
+                    ]
+                    
+                    os.makedirs("data", exist_ok=True)
+                    
+                    with open(filepath, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(tracks)
+                    
+                    print(f"  Successfully exported Liked Songs to {filepath}")
+                    success_count += 1
+            except Exception as e:
+                print(f"  Failed to export Liked Songs: {e}")
 
-        for i, playlist in enumerate(playlists, 1):
-            print(f"\n[{i}/{len(playlists)}] Exporting '{playlist['name']}'...")
+        # Export regular playlists
+        offset = 2 if include_liked_songs else 1
+        for i, playlist in enumerate(playlists, offset):
+            print(f"\n[{i}/{total_count}] Exporting '{playlist['name']}'...")
             try:
                 # Use the playlist name as the filename
                 filename = self._safe_filename(playlist["name"])
@@ -357,7 +557,7 @@ class SpotifyPlaylistExporter:
                 continue
 
         print(
-            f"\nExport completed! Successfully exported {success_count}/{len(playlists)} playlists."
+            f"\nExport completed! Successfully exported {success_count}/{total_count} playlists."
         )
         return success_count > 0
 
@@ -497,7 +697,7 @@ class SpotifyPlaylistExporter:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Export a Spotify playlist to CSV (with optional audio features)."
+        description="Export Spotify playlists to CSV (including Liked Songs)."
     )
     p.add_argument(
         "--client-id",
@@ -516,7 +716,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--playlist",
-        help="Name of the playlist to export. If omitted, lists playlists and prompts.",
+        help="Name of the playlist to export. Use 'Liked Songs' or 'Liked' for your liked songs. If omitted, lists playlists and prompts.",
     )
     p.add_argument("--outfile", help="CSV output file (defaults to '<playlist>.csv')")
     p.add_argument(
@@ -524,8 +724,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip audio features (fewer API calls).",
     )
-    p.add_argument("--all", action="store_true", help="Export all playlists.")
+    p.add_argument("--all", action="store_true", help="Export all playlists including Liked Songs.")
     p.add_argument("--merge", action="store_true", help="Merge all CSV files in /data directory.")
+    p.add_argument(
+        "--liked",
+        action="store_true",
+        help="Export only Liked Songs.",
+    )
     return p.parse_args(argv)
 
 
@@ -566,10 +771,29 @@ def main(argv: List[str]):
         except Exception as e:
             print(f"Unexpected error: {e}")
             sys.exit(1)
-    elif args.all:
-        # Export all playlists
+    elif args.liked:
+        # Export only Liked Songs
         try:
-            ok = exporter.export_all_playlists(fetch_features=(not args.no_features))
+            ok = exporter.export_playlist_to_csv(
+                playlist_name="Liked Songs",
+                filename=args.outfile,
+                fetch_features=(not args.no_features),
+            )
+            if ok:
+                print("Export completed successfully!")
+        except SpotifyException as e:
+            print(f"Spotify API error ({getattr(e, 'http_status', '?')}): {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            sys.exit(1)
+    elif args.all:
+        # Export all playlists including Liked Songs
+        try:
+            ok = exporter.export_all_playlists(
+                fetch_features=(not args.no_features),
+                include_liked_songs=True
+            )
             if ok:
                 print("Export completed successfully!")
         except SpotifyException as e:
@@ -583,7 +807,7 @@ def main(argv: List[str]):
         if not playlist_name:
             exporter.list_playlists()
             print()
-            playlist_name = input("Enter the name of the playlist to export: ").strip()
+            playlist_name = input("Enter the name of the playlist to export (or 'Liked Songs' for liked songs): ").strip()
 
         try:
             ok = exporter.export_playlist_to_csv(
