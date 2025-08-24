@@ -361,6 +361,98 @@ class SpotifyPlaylistExporter:
         )
         return success_count > 0
 
+    def merge_lists(self) -> bool:
+        """Merge all CSV files in the /data directory, deduplicate, and sort by track_name."""
+        data_dir = "data"
+        output_file = os.path.join(data_dir, "total_list.csv")
+        
+        # Check if data directory exists
+        if not os.path.exists(data_dir):
+            print(f"Data directory '{data_dir}' not found!")
+            return False
+        
+        # Find all CSV files in the data directory
+        csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv') and f != "total_list.csv"]
+        if not csv_files:
+            print("No CSV files found in the data directory!")
+            return False
+        
+        print(f"Found {len(csv_files)} CSV files to merge: {', '.join(csv_files)}")
+        
+        # Read all CSV files and collect unique tracks
+        unique_tracks = {}
+        fieldnames = None
+        
+        for csv_file in csv_files:
+            filepath = os.path.join(data_dir, csv_file)
+            print(f"Processing {filepath}...")
+            
+            with open(filepath, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                
+                # Store fieldnames from the first file
+                if fieldnames is None:
+                    fieldnames = reader.fieldnames
+                
+                # Process each row
+                for row in reader:
+                    # Create a unique key based on track_name and artist_names
+                    key = (row["track_name"], row["artist_names"])
+                    
+                    # Only add if this track isn't already in our collection
+                    if key not in unique_tracks:
+                        unique_tracks[key] = row
+        
+        if not unique_tracks:
+            print("No tracks found in CSV files!")
+            return False
+        
+        # Convert to list and sort by track_name
+        sorted_tracks = sorted(unique_tracks.values(), key=lambda x: x["track_name"])
+        
+        # Define fieldnames if not already defined (shouldn't happen but just in case)
+        if fieldnames is None:
+            fieldnames = [
+                "track_name",
+                "artist_names",
+                "album_name",
+                "album_type",
+                "release_date",
+                "duration_ms",
+                "duration_min_sec",
+                "popularity",
+                "explicit",
+                "track_number",
+                "disc_number",
+                "spotify_id",
+                "spotify_url",
+                "preview_url",
+                "added_at",
+                "added_by",
+                "danceability",
+                "energy",
+                "key",
+                "loudness",
+                "mode",
+                "speechiness",
+                "acousticness",
+                "instrumentalness",
+                "liveness",
+                "valence",
+                "tempo",
+                "time_signature",
+            ]
+        
+        # Write to output file
+        print(f"Writing {len(sorted_tracks)} unique tracks to {output_file}...")
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(sorted_tracks)
+        
+        print(f"Successfully merged playlists into {output_file}")
+        return True
+
     # ---------- retry wrapper ----------
     def _retry(
         self, func, max_retries: int = 5, swallow_statuses: Optional[set] = None
@@ -433,6 +525,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Skip audio features (fewer API calls).",
     )
     p.add_argument("--all", action="store_true", help="Export all playlists.")
+    p.add_argument("--merge", action="store_true", help="Merge all CSV files in /data directory.")
     return p.parse_args(argv)
 
 
@@ -461,7 +554,19 @@ def main(argv: List[str]):
 
     exporter = SpotifyPlaylistExporter(client_id, client_secret, args.redirect_uri)
 
-    if args.all:
+    if args.merge:
+        # Merge all CSV files
+        try:
+            ok = exporter.merge_lists()
+            if ok:
+                print("Merge completed successfully!")
+            else:
+                print("Merge failed!")
+                sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            sys.exit(1)
+    elif args.all:
         # Export all playlists
         try:
             ok = exporter.export_all_playlists(fetch_features=(not args.no_features))
