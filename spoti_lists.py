@@ -10,45 +10,34 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException
 
-
-REDIRECT_URI_DEFAULT = "http://127.0.0.1:8080/callback"  # loopback HTTP is allowed
-# Added user-library-read scope for Liked Songs access
+REDIRECT_URI_DEFAULT = "http://127.0.0.1:8080/callback"
 SCOPE = "playlist-read-private playlist-read-collaborative user-library-read"
 
-
 def load_secrets():
-    """Load Spotify API credentials from .api_secrets file."""
     secrets_file = ".api_secrets"
     if not os.path.exists(secrets_file):
         return None, None
-
     client_id = None
     client_secret = None
-
     with open(secrets_file, "r") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
                 if "=" in line:
                     key, value = line.split("=", 1)
-                    # Strip whitespace and quotes from value
                     value = value.strip().strip("\"'")
                     if key == "SPOTIFY_CLIENT_ID" and value:
                         client_id = value
                     elif key == "SPOTIFY_CLIENT_SECRET" and value:
                         client_secret = value
-
-    # Check if we have both credentials and they're not empty
     if client_id and client_secret:
         return client_id, client_secret
     else:
         return None, None
 
-
 def backoff_sleep(retry_count: int, base: float = 0.5, cap: float = 8.0):
     sleep = min(cap, base * (2**retry_count))
     time.sleep(sleep)
-
 
 class SpotifyPlaylistExporter:
     def __init__(
@@ -56,15 +45,36 @@ class SpotifyPlaylistExporter:
         client_id: str,
         client_secret: str,
         redirect_uri: str = REDIRECT_URI_DEFAULT,
+        username: str = "me",
+        reauth: bool = False,
     ):
+        """
+        username is an arbitrary label used both for token cache and for file prefixing.
+        Use a stable identifier (e.g., actual Spotify user ID or a nickname you choose).
+        """
+        cache_path = f".cache-{username}"
+        self.username = username
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
                 client_id=client_id,
                 client_secret=client_secret,
                 redirect_uri=redirect_uri,
                 scope=SCOPE,
+                cache_path=cache_path,
+                open_browser=True,
+                show_dialog=reauth or not os.path.exists(cache_path),  # <= force account chooser
             )
         )
+
+        # fetch and record the real authenticated user
+        me = self.sp.current_user()
+        if me:
+            self.authenticated_user_id = me.get("id")
+            self.authenticated_display_name = (me.get("display_name") or self.authenticated_user_id)
+        else:
+            self.authenticated_user_id = None
+            self.authenticated_display_name = None
+        print(f"[{self.username}] Authenticated as Spotify user: {self.authenticated_display_name}")
 
     # ---------- playlist helpers ----------
     def get_user_playlists(self) -> List[dict]:
@@ -80,24 +90,17 @@ class SpotifyPlaylistExporter:
 
     def list_playlists(self) -> List[dict]:
         playlists = self.get_user_playlists()
-        
-        # Get count of liked songs
         liked_songs_info = self._retry(lambda: self.sp.current_user_saved_tracks(limit=1))
         liked_songs_count = liked_songs_info.get('total', 0) if liked_songs_info else 0
-        
-        print(f"Found {len(playlists) + 1} playlists:")
+        print(f"[{self.username}] Found {len(playlists) + 1} playlists:")
         print(f" 1. Liked Songs ({liked_songs_count} tracks) [Special Collection]")
-        
         for i, p in enumerate(playlists, 2):
             print(f"{i:2d}. {p['name']} ({p['tracks']['total']} tracks)")
         return playlists
 
     def find_playlist_by_name(self, playlist_name: str) -> Optional[dict]:
-        # Special handling for "Liked Songs"
         if playlist_name.lower() in ["liked songs", "liked", "saved songs", "saved"]:
-            # Return a special marker for liked songs
             return {"id": "LIKED_SONGS", "name": "Liked Songs", "tracks": {"total": -1}}
-        
         for playlist in self.get_user_playlists():
             if playlist["name"].lower() == playlist_name.lower():
                 return playlist
@@ -105,57 +108,42 @@ class SpotifyPlaylistExporter:
 
     # ---------- Liked Songs support ----------
     def get_liked_songs(self, fetch_features: bool = True) -> List[dict]:
-        """Fetch all liked/saved songs from the user's library."""
         tracks: List[dict] = []
         raw_items: List[dict] = []
-        
-        print("Fetching liked songs...")
-        
-        # 1) Gather all liked songs
+        print(f"[{self.username}] Fetching liked songs...")
         results = self._retry(lambda: self.sp.current_user_saved_tracks(limit=50))
         total = results.get('total', 0) if results else 0
-        print(f"Total liked songs: {total}")
-        
+        print(f"[{self.username}] Total liked songs: {total}")
         while results:
             raw_items.extend(results["items"])
-            print(f"  Fetched {len(raw_items)}/{total} songs...")
+            print(f"[{self.username}]   Fetched {len(raw_items)}/{total} songs...")
             if results.get("next"):
                 results = self._retry(lambda: self.sp.next(results))
             else:
                 break
-        
-        # 2) Filter to valid track items and collect IDs
+
         valid_ids: List[str] = []
-        for item in raw_items:
-            tr = item.get("track")
-            if not tr:
-                continue
-            if tr.get("is_local"):
-                continue
-            if not tr.get("id"):
-                continue
-            valid_ids.append(tr["id"])
-        
-        # 3) Batch-fetch audio features if requested
-        features_by_id: Dict[str, Optional[dict]] = {}
-        if fetch_features and valid_ids:
-            print(f"Fetching audio features for {len(valid_ids)} tracks...")
-            for i in range(0, len(valid_ids), 100):
-                batch = valid_ids[i : i + 100]
-                
-                def _get_feats():
-                    return self.sp.audio_features(batch)
-                
-                feats_list = self._retry(_get_feats, swallow_statuses={403})
-                for tid, feats in zip(batch, feats_list or [None] * len(batch)):
-                    features_by_id[tid] = feats
-        
-        # 4) Build final rows
         for item in raw_items:
             tr = item.get("track")
             if not tr or tr.get("is_local") or not tr.get("id"):
                 continue
-            
+            valid_ids.append(tr["id"])
+
+        features_by_id: Dict[str, Optional[dict]] = {}
+        if fetch_features and valid_ids:
+            print(f"[{self.username}] Fetching audio features for {len(valid_ids)} tracks...")
+            for i in range(0, len(valid_ids), 100):
+                batch = valid_ids[i : i + 100]
+                def _get_feats():
+                    return self.sp.audio_features(batch)
+                feats_list = self._retry(_get_feats, swallow_statuses={403})
+                for tid, feats in zip(batch, feats_list or [None] * len(batch)):
+                    features_by_id[tid] = feats
+
+        for item in raw_items:
+            tr = item.get("track")
+            if not tr or tr.get("is_local") or not tr.get("id"):
+                continue
             dur_ms = tr.get("duration_ms") or 0
             track_row = {
                 "track_name": tr.get("name", ""),
@@ -175,9 +163,8 @@ class SpotifyPlaylistExporter:
                 "spotify_url": tr.get("external_urls", {}).get("spotify", ""),
                 "preview_url": tr.get("preview_url") or "",
                 "added_at": item.get("added_at", ""),
-                "added_by": "me",  # Liked songs are always added by the user
+                "added_by": self.username,
             }
-            
             feats = features_by_id.get(tr["id"]) if fetch_features else None
             if feats:
                 track_row.update(
@@ -213,9 +200,7 @@ class SpotifyPlaylistExporter:
                         "time_signature": "",
                     }
                 )
-            
             tracks.append(track_row)
-        
         return tracks
 
     # ---------- tracks & audio features ----------
@@ -225,7 +210,6 @@ class SpotifyPlaylistExporter:
         tracks: List[dict] = []
         raw_items: List[dict] = []
 
-        # 1) Gather all items
         results = self._retry(lambda: self.sp.playlist_tracks(playlist_id))
         while results:
             raw_items.extend(results["items"])
@@ -234,38 +218,29 @@ class SpotifyPlaylistExporter:
             else:
                 break
 
-        # 2) Filter to valid track items; assemble base track rows
         valid_ids: List[str] = []
         for item in raw_items:
             tr = item.get("track")
             if not tr:
-                continue  # removed/unavailable
+                continue
             if tr.get("is_local"):
-                continue  # local files have no audio features
+                continue
             if tr.get("type") != "track":
-                continue  # episodes/ads won't have audio features
+                continue
             if not tr.get("id"):
-                continue  # missing ID
+                continue
             valid_ids.append(tr["id"])
 
-        # 3) Batch-fetch audio features if requested
         features_by_id: Dict[str, Optional[dict]] = {}
         if fetch_features and valid_ids:
             for i in range(0, len(valid_ids), 100):
                 batch = valid_ids[i : i + 100]
-
-                # resilient fetch with retry handling
                 def _get_feats():
                     return self.sp.audio_features(batch)
-
-                feats_list = self._retry(
-                    _get_feats, swallow_statuses={403}
-                )  # 403 -> forbidden for some IDs
-                # Spotipy returns list aligned to input with None for unknowns
+                feats_list = self._retry(_get_feats, swallow_statuses={403})
                 for tid, feats in zip(batch, feats_list or [None] * len(batch)):
                     features_by_id[tid] = feats
 
-        # 4) Build final rows
         for item in raw_items:
             tr = item.get("track")
             if (
@@ -317,7 +292,6 @@ class SpotifyPlaylistExporter:
                     }
                 )
             else:
-                # Keep columns present but empty if features unavailable
                 track_row.update(
                     {
                         "danceability": "",
@@ -336,7 +310,6 @@ class SpotifyPlaylistExporter:
                 )
 
             tracks.append(track_row)
-
         return tracks
 
     # ---------- CSV ----------
@@ -344,6 +317,12 @@ class SpotifyPlaylistExporter:
     def _safe_filename(name: str) -> str:
         safe = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_")).rstrip()
         return f"{safe}.csv" if not safe.endswith(".csv") else safe
+
+    def _prefixed_path(self, base_name: str) -> str:
+        """Return data/<username>__<safe_name>.csv"""
+        filename = self._safe_filename(base_name)
+        prefixed = f"{self.username}__{filename}"
+        return os.path.join("data", prefixed)
 
     def export_playlist_to_csv(
         self,
@@ -353,313 +332,166 @@ class SpotifyPlaylistExporter:
     ) -> bool:
         playlist = self.find_playlist_by_name(playlist_name)
         if not playlist:
-            print(f"Playlist '{playlist_name}' not found!")
+            print(f"[{self.username}] Playlist '{playlist_name}' not found!")
             print("Available playlists:")
             print("  - Liked Songs")
             for p in self.get_user_playlists():
                 print(f"  - {p['name']}")
             return False
 
-        # Check if this is the special "Liked Songs" playlist
         if playlist.get("id") == "LIKED_SONGS":
-            print("Found special collection: Liked Songs")
-            print("Fetching liked songs data...")
+            print(f"[{self.username}] Found special collection: Liked Songs")
+            print(f"[{self.username}] Fetching liked songs data...")
             tracks = self.get_liked_songs(fetch_features=fetch_features)
             playlist_name = "Liked Songs"
         else:
             total = playlist["tracks"]["total"]
-            print(f"Found playlist: {playlist['name']} ({total} tracks)")
-            print("Fetching track data...")
+            print(f"[{self.username}] Found playlist: {playlist['name']} ({total} tracks)")
+            print(f"[{self.username}] Fetching track data...")
             tracks = self.get_playlist_tracks(playlist["id"], fetch_features=fetch_features)
-        
+
         if not tracks:
-            print("No exportable tracks found.")
+            print(f"[{self.username}] No exportable tracks found.")
             return False
 
-        filename = filename or self._safe_filename(playlist_name)
-        # Save to /data directory
-        filepath = os.path.join("data", filename)
-        print(f"Writing {len(tracks)} tracks to {filepath}...")
+        os.makedirs("data", exist_ok=True)
+        filepath = self._prefixed_path(filename or playlist_name)
+        print(f"[{self.username}] Writing {len(tracks)} tracks to {filepath}...")
 
         fieldnames = [
-            "track_name",
-            "artist_names",
-            "album_name",
-            "album_type",
-            "release_date",
-            "duration_ms",
-            "duration_min_sec",
-            "popularity",
-            "explicit",
-            "track_number",
-            "disc_number",
-            "spotify_id",
-            "spotify_url",
-            "preview_url",
-            "added_at",
-            "added_by",
-            "danceability",
-            "energy",
-            "key",
-            "loudness",
-            "mode",
-            "speechiness",
-            "acousticness",
-            "instrumentalness",
-            "liveness",
-            "valence",
-            "tempo",
-            "time_signature",
+            "track_name","artist_names","album_name","album_type","release_date",
+            "duration_ms","duration_min_sec","popularity","explicit","track_number","disc_number",
+            "spotify_id","spotify_url","preview_url","added_at","added_by",
+            "danceability","energy","key","loudness","mode","speechiness",
+            "acousticness","instrumentalness","liveness","valence","tempo","time_signature",
         ]
-
-        # Ensure the data directory exists
-        os.makedirs("data", exist_ok=True)
 
         with open(filepath, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(tracks)
 
-        print(f"Successfully exported playlist to {filepath}")
+        print(f"[{self.username}] Successfully exported playlist to {filepath}")
         return True
 
     def export_all_playlists(self, fetch_features: bool = True, include_liked_songs: bool = True) -> bool:
-        """Export all playlists to CSV files in the /data directory."""
         playlists = self.get_user_playlists()
-        
-        # Optionally add Liked Songs to the export list
-        total_count = len(playlists)
-        if include_liked_songs:
-            total_count += 1
-        
+        total_count = len(playlists) + (1 if include_liked_songs else 0)
         if total_count == 0:
-            print("No playlists found!")
+            print(f"[{self.username}] No playlists found!")
             return False
 
-        print(f"Found {total_count} playlists. Exporting all...")
+        print(f"[{self.username}] Found {total_count} playlists. Exporting all...")
         success_count = 0
-        
-        # Export Liked Songs first if requested
+
         if include_liked_songs:
-            print(f"\n[1/{total_count}] Exporting 'Liked Songs'...")
+            print(f"\n[{self.username}] [1/{total_count}] Exporting 'Liked Songs'...")
             try:
                 tracks = self.get_liked_songs(fetch_features=fetch_features)
-                if not tracks:
-                    print("  No liked songs found.")
-                else:
-                    filename = self._safe_filename("Liked Songs")
-                    filepath = os.path.join("data", filename)
-                    print(f"  Writing {len(tracks)} tracks to {filepath}...")
-                    
-                    fieldnames = [
-                        "track_name",
-                        "artist_names",
-                        "album_name",
-                        "album_type",
-                        "release_date",
-                        "duration_ms",
-                        "duration_min_sec",
-                        "popularity",
-                        "explicit",
-                        "track_number",
-                        "disc_number",
-                        "spotify_id",
-                        "spotify_url",
-                        "preview_url",
-                        "added_at",
-                        "added_by",
-                        "danceability",
-                        "energy",
-                        "key",
-                        "loudness",
-                        "mode",
-                        "speechiness",
-                        "acousticness",
-                        "instrumentalness",
-                        "liveness",
-                        "valence",
-                        "tempo",
-                        "time_signature",
-                    ]
-                    
+                if tracks:
                     os.makedirs("data", exist_ok=True)
-                    
+                    filepath = self._prefixed_path("Liked Songs")
+                    print(f"[{self.username}]   Writing {len(tracks)} tracks to {filepath}...")
+                    fieldnames = [
+                        "track_name","artist_names","album_name","album_type","release_date",
+                        "duration_ms","duration_min_sec","popularity","explicit","track_number","disc_number",
+                        "spotify_id","spotify_url","preview_url","added_at","added_by",
+                        "danceability","energy","key","loudness","mode","speechiness",
+                        "acousticness","instrumentalness","liveness","valence","tempo","time_signature",
+                    ]
                     with open(filepath, "w", newline="", encoding="utf-8") as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames)
                         writer.writeheader()
                         writer.writerows(tracks)
-                    
-                    print(f"  Successfully exported Liked Songs to {filepath}")
+                    print(f"[{self.username}]   Successfully exported Liked Songs to {filepath}")
                     success_count += 1
+                else:
+                    print(f"[{self.username}]   No liked songs found.")
             except Exception as e:
-                print(f"  Failed to export Liked Songs: {e}")
+                print(f"[{self.username}]   Failed to export Liked Songs: {e}")
 
-        # Export regular playlists
         offset = 2 if include_liked_songs else 1
         for i, playlist in enumerate(playlists, offset):
-            print(f"\n[{i}/{total_count}] Exporting '{playlist['name']}'...")
+            print(f"\n[{self.username}] [{i}/{total_count}] Exporting '{playlist['name']}'...")
             try:
-                # Use the playlist name as the filename
-                filename = self._safe_filename(playlist["name"])
-                tracks = self.get_playlist_tracks(
-                    playlist["id"], fetch_features=fetch_features
-                )
+                tracks = self.get_playlist_tracks(playlist["id"], fetch_features=fetch_features)
                 if not tracks:
-                    print("  No exportable tracks found.")
+                    print(f"[{self.username}]   No exportable tracks found.")
                     continue
-
-                filepath = os.path.join("data", filename)
-                print(f"  Writing {len(tracks)} tracks to {filepath}...")
+                os.makedirs("data", exist_ok=True)
+                filepath = self._prefixed_path(playlist["name"])
+                print(f"[{self.username}]   Writing {len(tracks)} tracks to {filepath}...")
 
                 fieldnames = [
-                    "track_name",
-                    "artist_names",
-                    "album_name",
-                    "album_type",
-                    "release_date",
-                    "duration_ms",
-                    "duration_min_sec",
-                    "popularity",
-                    "explicit",
-                    "track_number",
-                    "disc_number",
-                    "spotify_id",
-                    "spotify_url",
-                    "preview_url",
-                    "added_at",
-                    "added_by",
-                    "danceability",
-                    "energy",
-                    "key",
-                    "loudness",
-                    "mode",
-                    "speechiness",
-                    "acousticness",
-                    "instrumentalness",
-                    "liveness",
-                    "valence",
-                    "tempo",
-                    "time_signature",
+                    "track_name","artist_names","album_name","album_type","release_date",
+                    "duration_ms","duration_min_sec","popularity","explicit","track_number","disc_number",
+                    "spotify_id","spotify_url","preview_url","added_at","added_by",
+                    "danceability","energy","key","loudness","mode","speechiness",
+                    "acousticness","instrumentalness","liveness","valence","tempo","time_signature",
                 ]
-
-                # Ensure the data directory exists
-                os.makedirs("data", exist_ok=True)
-
                 with open(filepath, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
                     writer.writerows(tracks)
 
-                print(f"  Successfully exported playlist to {filepath}")
+                print(f"[{self.username}]   Successfully exported playlist to {filepath}")
                 success_count += 1
             except Exception as e:
-                print(f"  Failed to export playlist '{playlist['name']}': {e}")
+                print(f"[{self.username}]   Failed to export playlist '{playlist['name']}': {e}")
                 continue
 
-        print(
-            f"\nExport completed! Successfully exported {success_count}/{total_count} playlists."
-        )
+        print(f"\n[{self.username}] Export completed! Successfully exported {success_count}/{total_count}.")
         return success_count > 0
 
     def merge_lists(self) -> bool:
-        """Merge all CSV files in the /data directory, deduplicate, and sort by track_name."""
         data_dir = "data"
         output_file = os.path.join(data_dir, "total_list.csv")
-        
-        # Check if data directory exists
         if not os.path.exists(data_dir):
-            print(f"Data directory '{data_dir}' not found!")
+            print(f"[{self.username}] Data directory '{data_dir}' not found!")
             return False
-        
-        # Find all CSV files in the data directory
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv') and f != "total_list.csv"]
         if not csv_files:
-            print("No CSV files found in the data directory!")
+            print(f"[{self.username}] No CSV files found in the data directory!")
             return False
-        
-        print(f"Found {len(csv_files)} CSV files to merge: {', '.join(csv_files)}")
-        
-        # Read all CSV files and collect unique tracks
+        print(f"[{self.username}] Found {len(csv_files)} CSV files to merge: {', '.join(csv_files)}")
+
         unique_tracks = {}
         fieldnames = None
-        
         for csv_file in csv_files:
             filepath = os.path.join(data_dir, csv_file)
-            print(f"Processing {filepath}...")
-            
+            print(f"[{self.username}] Processing {filepath}...")
             with open(filepath, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
-                
-                # Store fieldnames from the first file
                 if fieldnames is None:
                     fieldnames = reader.fieldnames
-                
-                # Process each row
                 for row in reader:
-                    # Create a unique key based on track_name and artist_names
                     key = (row["track_name"], row["artist_names"])
-                    
-                    # Only add if this track isn't already in our collection
                     if key not in unique_tracks:
                         unique_tracks[key] = row
-        
         if not unique_tracks:
-            print("No tracks found in CSV files!")
+            print(f"[{self.username}] No tracks found in CSV files!")
             return False
-        
-        # Convert to list and sort by track_name
         sorted_tracks = sorted(unique_tracks.values(), key=lambda x: x["track_name"])
-        
-        # Define fieldnames if not already defined (shouldn't happen but just in case)
         if fieldnames is None:
             fieldnames = [
-                "track_name",
-                "artist_names",
-                "album_name",
-                "album_type",
-                "release_date",
-                "duration_ms",
-                "duration_min_sec",
-                "popularity",
-                "explicit",
-                "track_number",
-                "disc_number",
-                "spotify_id",
-                "spotify_url",
-                "preview_url",
-                "added_at",
-                "added_by",
-                "danceability",
-                "energy",
-                "key",
-                "loudness",
-                "mode",
-                "speechiness",
-                "acousticness",
-                "instrumentalness",
-                "liveness",
-                "valence",
-                "tempo",
-                "time_signature",
+                "track_name","artist_names","album_name","album_type","release_date",
+                "duration_ms","duration_min_sec","popularity","explicit","track_number","disc_number",
+                "spotify_id","spotify_url","preview_url","added_at","added_by",
+                "danceability","energy","key","loudness","mode","speechiness",
+                "acousticness","instrumentalness","liveness","valence","tempo","time_signature",
             ]
-        
-        # Write to output file
-        print(f"Writing {len(sorted_tracks)} unique tracks to {output_file}...")
+        print(f"[{self.username}] Writing {len(sorted_tracks)} unique tracks to {output_file}...")
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(sorted_tracks)
-        
-        print(f"Successfully merged playlists into {output_file}")
+        print(f"[{self.username}] Successfully merged playlists into {output_file}")
         return True
 
     # ---------- retry wrapper ----------
     def _retry(
         self, func, max_retries: int = 5, swallow_statuses: Optional[set] = None
     ):
-        """Retry Spotify requests on 429 / transient errors.
-        If swallow_statuses is provided (e.g., {403}), return None on those status codes.
-        """
         swallow_statuses = swallow_statuses or set()
         attempt = 0
         while True:
@@ -667,7 +499,6 @@ class SpotifyPlaylistExporter:
                 return func()
             except SpotifyException as e:
                 status = getattr(e, "http_status", None)
-                # Rate limited
                 if status == 429:
                     attempt += 1
                     retry_after = 1.0
@@ -677,15 +508,12 @@ class SpotifyPlaylistExporter:
                         pass
                     time.sleep(retry_after)
                     continue
-                # Swallow configured statuses (e.g., 403 from audio-features batch)
                 if status in swallow_statuses:
                     return None
-                # Transient server errors
                 if status in (500, 502, 503, 504) and attempt < max_retries:
                     attempt += 1
                     backoff_sleep(attempt)
                     continue
-                # Propagate others
                 raise
             except Exception:
                 if attempt < max_retries:
@@ -694,141 +522,144 @@ class SpotifyPlaylistExporter:
                     continue
                 raise
 
-
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Export Spotify playlists to CSV (including Liked Songs)."
     )
+    p.add_argument("--client-id", required=False, help="Spotify app Client ID")
+    p.add_argument("--client-secret", required=False, help="Spotify app Client Secret")
+    p.add_argument("--redirect-uri", default=REDIRECT_URI_DEFAULT,
+                   help=f"Redirect URI registered in your app (default: {REDIRECT_URI_DEFAULT})")
+    p.add_argument("--playlist",
+                   help="Name of the playlist to export. Use 'Liked Songs' for liked songs.")
+    p.add_argument("--outfile", help="CSV output file (overrides default)")
+    p.add_argument("--no-features", action="store_true", help="Skip audio features.")
+    p.add_argument("--all", action="store_true", help="Export all playlists incl. Liked Songs.")
+    p.add_argument("--merge", action="store_true", help="Merge all CSV files in /data.")
+    p.add_argument("--liked", action="store_true", help="Export only Liked Songs.")
+    p.add_argument("--no-liked", action="store_true", help="Exclude Liked Songs when exporting all.")
+    p.add_argument("--reauth", action="store_true",
+                   help="Force re-consent (opens Spotify login even if a cache exists).")
+    p.add_argument("--allow-mismatch", action="store_true",
+                   help="Proceed even if the authenticated Spotify user ID != label in --users.")
     p.add_argument(
-        "--client-id",
-        required=False,
-        help="Spotify app Client ID (can also be set in .api_secrets file)",
-    )
-    p.add_argument(
-        "--client-secret",
-        required=False,
-        help="Spotify app Client Secret (can also be set in .api_secrets file)",
-    )
-    p.add_argument(
-        "--redirect-uri",
-        default=REDIRECT_URI_DEFAULT,
-        help=f"Redirect URI registered in your app (default: {REDIRECT_URI_DEFAULT})",
-    )
-    p.add_argument(
-        "--playlist",
-        help="Name of the playlist to export. Use 'Liked Songs' or 'Liked' for your liked songs. If omitted, lists playlists and prompts.",
-    )
-    p.add_argument("--outfile", help="CSV output file (defaults to '<playlist>.csv')")
-    p.add_argument(
-        "--no-features",
-        action="store_true",
-        help="Skip audio features (fewer API calls).",
-    )
-    p.add_argument("--all", action="store_true", help="Export all playlists including Liked Songs.")
-    p.add_argument("--merge", action="store_true", help="Merge all CSV files in /data directory.")
-    p.add_argument(
-        "--liked",
-        action="store_true",
-        help="Export only Liked Songs.",
-    )
-    p.add_argument(
-        "--no-liked",
-        action="store_true",
-        help="Exclude Liked Songs when exporting all playlists.",
+        "--users",
+        help="Comma-separated list of usernames to export for (e.g., 'bob,mariaploughwood'). "
+             "Each user will authenticate once; files are prefixed with '<user>__'."
     )
     return p.parse_args(argv)
 
+def print_last_5_chars(client_id, client_secret):
+    if client_id:
+        print(f"Using Client ID ending in: {client_id[-5:]}")
+    else:
+        print("Client ID: None")
+    if client_secret:
+        print(f"Using Client Secret ending in: {client_secret[-5:]}")
+    else:
+        print("Client Secret: None")
+
+def run_for_user(args: argparse.Namespace, username: str, client_id: str, client_secret: str):
+    exporter = SpotifyPlaylistExporter(client_id, client_secret, args.redirect_uri,
+                                       username=username, reauth=args.reauth)
+
+    # Check for user mismatch
+    if (exporter.authenticated_user_id and username not in (exporter.authenticated_user_id, exporter.authenticated_display_name)) \
+            and not args.allow_mismatch:
+        print(f"[{username}] WARNING: You authenticated as '{exporter.authenticated_display_name}' "
+              f"(id: {exporter.authenticated_user_id}), not as label '{username}'. "
+              f"This is OK if '{username}' is just a label for user '{exporter.authenticated_display_name}'.")
+        # Continue execution instead of returning, as the user might have intentionally used a different label
+    
+    # Print authenticated user information
+    try:
+        me = exporter.sp.current_user()
+        if me:
+            print(f"[{username}] Authenticated as: {me.get('display_name') or me.get('id')}")
+        else:
+            print(f"[{username}] Authentication failed or user info unavailable")
+    except Exception as e:
+        print(f"[{username}] Error retrieving user info: {e}")
+
+    if args.merge:
+        ok = exporter.merge_lists()
+        if ok:
+            print(f"[{username}] Merge completed successfully!")
+        else:
+            print(f"[{username}] Merge failed!")
+            sys.exit(1)
+        return
+
+    if args.liked:
+        ok = exporter.export_playlist_to_csv(
+            playlist_name="Liked Songs",
+            filename=args.outfile,  # will still be prefixed
+            fetch_features=(not args.no_features),
+        )
+        if ok:
+            print(f"[{username}] Export completed successfully!")
+        return
+
+    if args.all:
+        ok = exporter.export_all_playlists(
+            fetch_features=(not args.no_features),
+            include_liked_songs=not args.no_liked,
+        )
+        if ok:
+            print(f"[{username}] Export completed successfully!")
+        return
+
+    # single playlist mode
+    playlist_name = args.playlist
+    if not playlist_name:
+        exporter.list_playlists()
+        print()
+        playlist_name = input(f"[{username}] Enter the playlist to export (or 'Liked Songs'): ").strip()
+
+    ok = exporter.export_playlist_to_csv(
+        playlist_name=playlist_name,
+        filename=args.outfile,  # will be prefixed
+        fetch_features=(not args.no_features),
+    )
+    if ok:
+        print(f"[{username}] Export completed successfully!")
 
 def main(argv: List[str]):
     args = parse_args(argv)
 
-    # Load secrets from .api_secrets file if not provided as arguments
     client_id = args.client_id
     client_secret = args.client_secret
-
     if not client_id or not client_secret:
         file_client_id, file_client_secret = load_secrets()
-        if not client_id:
-            client_id = file_client_id
-        if not client_secret:
-            client_secret = file_client_secret
+        client_id = client_id or file_client_id
+        client_secret = client_secret or file_client_secret
 
-    # Check if we have all required credentials
+    print_last_5_chars(client_id, client_secret)
+
     if not client_id or not client_secret:
         print("Error: Spotify Client ID and Client Secret are required.")
-        print(
-            "Please provide them either as command-line arguments or in a .api_secrets file."
-        )
-        print("Make sure the credentials are not empty in the .api_secrets file.")
+        print("Provide them as flags or in .api_secrets.")
         sys.exit(1)
 
-    exporter = SpotifyPlaylistExporter(client_id, client_secret, args.redirect_uri)
-
-    if args.merge:
-        # Merge all CSV files
-        try:
-            ok = exporter.merge_lists()
-            if ok:
-                print("Merge completed successfully!")
-            else:
-                print("Merge failed!")
-                sys.exit(1)
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            sys.exit(1)
-    elif args.liked:
-        # Export only Liked Songs
-        try:
-            ok = exporter.export_playlist_to_csv(
-                playlist_name="Liked Songs",
-                filename=args.outfile,
-                fetch_features=(not args.no_features),
-            )
-            if ok:
-                print("Export completed successfully!")
-        except SpotifyException as e:
-            print(f"Spotify API error ({getattr(e, 'http_status', '?')}): {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            sys.exit(1)
-    elif args.all:
-        # Export all playlists, optionally including Liked Songs
-        try:
-            ok = exporter.export_all_playlists(
-                fetch_features=(not args.no_features),
-                include_liked_songs=not args.no_liked
-            )
-            if ok:
-                print("Export completed successfully!")
-        except SpotifyException as e:
-            print(f"Spotify API error ({getattr(e, 'http_status', '?')}): {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Unexpected error: {e}")
+    # Determine target users
+    users: List[str]
+    if args.users:
+        users = [u.strip() for u in args.users.split(",") if u.strip()]
+        if not users:
+            print("Error: --users provided but empty after parsing.")
             sys.exit(1)
     else:
-        playlist_name = args.playlist
-        if not playlist_name:
-            exporter.list_playlists()
-            print()
-            playlist_name = input("Enter the name of the playlist to export (or 'Liked Songs' for liked songs): ").strip()
+        # single-user behavior (backward compatible); prefix will be 'me'
+        users = ["me"]
 
+    for username in users:
+        print(f"\n=== Processing user: {username} ===")
         try:
-            ok = exporter.export_playlist_to_csv(
-                playlist_name=playlist_name,
-                filename=args.outfile,
-                fetch_features=(not args.no_features),
-            )
-            if ok:
-                print("Export completed successfully!")
+            run_for_user(args, username, client_id, client_secret)
         except SpotifyException as e:
-            print(f"Spotify API error ({getattr(e, 'http_status', '?')}): {e}")
-            sys.exit(1)
+            print(f"[{username}] Spotify API error ({getattr(e, 'http_status', '?')}): {e}")
         except Exception as e:
-            print(f"Unexpected error: {e}")
-            sys.exit(1)
-
+            print(f"[{username}] Unexpected error: {e}")
 
 if __name__ == "__main__":
     main(sys.argv[1:])
